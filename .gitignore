@@ -2,3 +2,4 @@ descriptions/
 venv/
 properties.csv
 model/
+text_features.csv
