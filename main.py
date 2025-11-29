@@ -1,46 +1,72 @@
-from fastapi import FastAPI
-import joblib
-import numpy as np
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from pydantic import BaseModel
-from scipy.sparse import hstack
+import json
+import io
 
-model = joblib.load("model/xgb_model.joblib")
-tfidf = joblib.load("model/tfidf.joblib")
-loc_encoder = joblib.load("model/location_encoder.joblib")
+from model_logic import make_prediction, predict_price_with_gemini
 
-app = FastAPI()
+app = FastAPI(title="Real Estate Price Predictor")
 
-class PropertyInput(BaseModel):
+
+class PropertyFeatures(BaseModel):
     location: str
+    price: float = 0.0
     title: str
-    features: str
-    description: str
     bedrooms: float
     bathrooms: float
     indoor_area: float
     outdoor_area: float
+    features: str
+    description: str
 
-@app.post("/predict")
-def predict_price(item: PropertyInput):
+
+@app.post("/api/predict")
+async def predict(
+    features_json: str = Form(...),
+    image_files: list[UploadFile] = File(None),
+    image_urls_json: str = Form("[]"),
+):
+    try:
+        data_dict = json.loads(features_json)
+        property_data = PropertyFeatures(**data_dict).model_dump()
+        url_list = json.loads(image_urls_json)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON format for features or URLs: {exc}")
+
+    image_inputs = []
+    if image_files:
+        for file in image_files:
+            image_inputs.append(io.BytesIO(await file.read()))
+    image_inputs.extend(url_list)
 
     try:
-        loc_val = loc_encoder.transform([item.location])[0]
-    except:
-        loc_val = 0
+        predicted_price = make_prediction(property_data, image_inputs)
+        return {"predicted_price": f"€{predicted_price:,.2f}", "raw_price": round(predicted_price, 2)}
+    except Exception as exc:
+        print(f"Prediction error: {exc}")
+        raise HTTPException(status_code=500, detail="Prediction failed due to internal processing error.")
 
-    full_text = f"{item.title} {item.features} {item.description}"
-    X_text = tfidf.transform([full_text])
 
-    numeric = np.array([
-        item.bedrooms,
-        item.bathrooms,
-        item.indoor_area,
-        item.outdoor_area,
-        loc_val
-    ]).reshape(1, -1)
+@app.post("/api/predict_new")
+async def predict_new(features_json: str = Form(...)):
+    try:
+        data_dict = json.loads(features_json)
+        PropertyFeatures(**data_dict)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON format for features: {exc}")
 
-    X = hstack([X_text, numeric])
-
-    prediction = model.predict(X)[0]
-
-    return {"predicted_price": float(prediction)}
+    try:
+        prediction_result = await predict_price_with_gemini(data_dict)
+        predicted_price = prediction_result.predicted_price_eur
+        return {
+            "model": "Gemini (LLM/Search-Based)",
+            "predicted_price": f"€{predicted_price:,.2f}",
+            "raw_price": round(predicted_price, 2),
+            "confidence_level": prediction_result.confidence_level,
+            "justification": prediction_result.justification,
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=f"Gemini API Service Error: {exc}")
+    except Exception as exc:
+        print(f"Unexpected prediction error: {exc}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")

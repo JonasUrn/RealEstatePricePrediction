@@ -2,4 +2,6 @@ descriptions/
 venv/
 properties.csv
 model/
+images/
+__pycache__/
 text_features.csv
