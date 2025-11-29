@@ -1,140 +1,205 @@
 # model_logic.py
 
-# --------------------------------------------------------------------------
-# --- Setup (Global Initialization - Runs once when the FastAPI server starts) ---
-import pandas as pd
-import numpy as np
-import torch
-from torchvision import models, transforms
-from PIL import Image
-import requests
 import io
+import os
+from typing import Any, Dict, List
+
+import numpy as np
+import pandas as pd
+import requests
+import torch
+from PIL import Image
+from pydantic import BaseModel as PydanticBaseModel
+from torchvision import models, transforms
+
 from catboost import CatBoostRegressor
+from google import genai
+from google.genai import types
 
-# Load PyTorch model for feature extraction
-model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-model = torch.nn.Sequential(*(list(model.children())[:-1]))
-model.eval()
 
-# Standard ImageNet preprocessing
-preprocess = transforms.Compose([
-    transforms.Resize(256), transforms.CenterCrop(224), transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_CLIENT = None
+if GEMINI_API_KEY:
+    try:
+        GEMINI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as _init_exc:
+        print(f"Warning: failed to initialize Gemini client: {_init_exc}")
+        GEMINI_CLIENT = None
+else:
+    print("Warning: GEMINI_API_KEY environment variable not set; Gemini client disabled.")
 
-# Load the trained CatBoost model
-PREDICTIVE_MODEL = CatBoostRegressor()
-PREDICTIVE_MODEL.load_model('real_estate_model.cbm')
 
-# --------------------------------------------------------------------------
-# --- FEATURE ORDER LIST (CRITICAL FOR ALIGNMENT) ---
-# This list ensures the input DataFrame column order matches the model's training order.
+class PricePredictionSchema(PydanticBaseModel):
+    predicted_price_eur: float
+    confidence_level: float
+    justification: str
 
-# 1. Base Tabular/Text Features (Order as they appear in X_train)
+
 BASE_COLS = [
-    'location', 'title', 'bedrooms', 'bathrooms', 
-    'indoor_area', 'outdoor_area', 'features', 'description'
+    "location",
+    "title",
+    "bedrooms",
+    "bathrooms",
+    "indoor_area",
+    "outdoor_area",
+    "features",
+    "description",
 ]
 
-# 2. Image Feature Columns (512 dimensions)
-IMAGE_FEAT_COLS = [f'img_feat_{i}' for i in range(512)]
-
-# 3. Final Required Order
+IMAGE_FEAT_COLS = [f"img_feat_{i}" for i in range(512)]
 FINAL_FEATURE_ORDER = BASE_COLS + IMAGE_FEAT_COLS
-# --------------------------------------------------------------------------
 
 
-# --- Feature Extraction Functions ---
+_resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+_feature_extractor = torch.nn.Sequential(*list(_resnet.children())[:-1])
+_feature_extractor.eval()
 
-def process_image(img_stream):
-    """Processes a single image stream/file object to extract 512 features."""
+preprocess = transforms.Compose(
+    [
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ]
+)
+
+PREDICTIVE_MODEL = CatBoostRegressor()
+PREDICTIVE_MODEL.load_model("real_estate_model.cbm")
+
+
+def process_image(img_stream: io.BytesIO) -> np.ndarray | None:
     try:
-        img = Image.open(img_stream).convert('RGB')
+        img = Image.open(img_stream).convert("RGB")
         img_tensor = preprocess(img)
         with torch.no_grad():
-            feature_vector = model(img_tensor.unsqueeze(0)).squeeze().cpu().numpy()
+            feature_vector = _feature_extractor(img_tensor.unsqueeze(0)).squeeze().cpu().numpy()
         return feature_vector
     except Exception:
         return None
 
-def get_image_features(image_streams_or_urls: list, max_images=3):
-    """
-    Handles a list of image streams/URLs, extracts features, and averages them.
-    """
-    features = []
-    
-    # Process up to max_images
+
+def get_image_features(image_streams_or_urls: List[Any], max_images: int = 3) -> np.ndarray:
+    features: List[np.ndarray] = []
     for item in image_streams_or_urls[:max_images]:
         img_stream = None
-        
-        # 1. Handle File Stream (BytesIO)
         if isinstance(item, io.BytesIO):
             img_stream = item
-        
-        # 2. Handle URL
-        elif isinstance(item, str) and item.startswith(('http', 'https')):
+        elif isinstance(item, str) and item.startswith(("http", "https")):
             try:
-                # Use a small timeout for external requests
                 response = requests.get(item, timeout=3)
-                response.raise_for_status() 
+                response.raise_for_status()
                 img_stream = io.BytesIO(response.content)
             except Exception:
-                continue # Skip bad URL or download failure
-        
+                continue
         if img_stream:
             feature_vector = process_image(img_stream)
             if feature_vector is not None:
                 features.append(feature_vector)
-
     if features:
         return np.mean(features, axis=0)
-    else:
-        # Must return a zero vector of the correct size (512) for the DataFrame
-        return np.zeros(512) 
+    return np.zeros(512)
 
 
-# --- Main Prediction Function ---
+def encode_location_target(df: pd.DataFrame, price_col: str = "price") -> pd.DataFrame:
+    loc_median = df.groupby("location")[price_col].median()
+    df["loc_target_enc"] = df["location"].map(loc_median).fillna(df[price_col].median())
+    loc_count = df["location"].value_counts()
+    df["loc_freq"] = df["location"].map(loc_count).fillna(0).astype(float)
+    df["loc_freq"] = df["loc_freq"] / len(df)
+    return df
 
-def make_prediction(data: dict, image_inputs: list):
-    """Applies all preprocessing and runs the prediction."""
-    
-    # 1. Feature Extraction
+
+def prepare_features(df: pd.DataFrame) -> tuple[np.ndarray, List[str], List[str]]:
+    num_cols = [
+        "bedrooms",
+        "bathrooms",
+        "indoor_area",
+        "outdoor_area",
+        "total_area",
+        "has_outdoor",
+        "outdoor_ratio",
+        "bed_bath_ratio",
+        "total_rooms",
+        "room_density",
+        "area_per_bedroom",
+        "loc_target_enc",
+        "loc_freq",
+    ]
+    num = df[num_cols].values
+    emb_cols = [c for c in df.columns if c.startswith("emb_")]
+    emb = df[emb_cols].values if len(emb_cols) > 0 else np.zeros((len(df), 0))
+    X = np.hstack([num, emb])
+    return X, num_cols, emb_cols
+
+
+def normalize_numeric(X: np.ndarray, num_cols_count: int) -> tuple[np.ndarray, Any]:
+    from sklearn.preprocessing import StandardScaler
+
+    scaler = StandardScaler()
+    X_num = X[:, :num_cols_count]
+    X[:, :num_cols_count] = scaler.fit_transform(X_num)
+    return X, scaler
+
+
+def make_prediction(data: Dict[str, Any], image_inputs: List[Any]) -> float:
     image_features = get_image_features(image_inputs)
-
-    # 2. Construct Base DataFrame
-    # Create the base DataFrame from the input dict
     X = pd.DataFrame([data])
-    
-    # 3. Add Image Features
     for i, feat in enumerate(image_features):
-        X[f'img_feat_{i}'] = feat
-        
-    # 4. Apply Training Preprocessing (Must match data_loader.py logic)
-    
-    # Fill NaN for text/categorical columns (should already be done by Pydantic but safe)
-    X['features'] = X['features'].fillna("").astype(str)
-    X['description'] = X['description'].fillna("").astype(str)
-    X['title'] = X['title'].fillna("").astype(str)
+        X[f"img_feat_{i}"] = feat
+    X["features"] = X["features"].fillna("").astype(str)
+    X["description"] = X["description"].fillna("").astype(str)
+    X["title"] = X["title"].fillna("").astype(str)
     X["location"] = X["location"].astype(str)
-    
-    # Log Transformation for Area Features (CRUCIAL)
-    # The training data was log-transformed.
-    X['indoor_area'] = np.log1p(X['indoor_area'].fillna(0))
-    X['outdoor_area'] = np.log1p(X['outdoor_area'].fillna(0))
-
-    # 5. Enforce Final Feature Order (THE FIX)
-    # Select and reorder columns to match FINAL_FEATURE_ORDER exactly.
-    try:
-        X_predict = X[FINAL_FEATURE_ORDER]
-    except KeyError as e:
-        raise ValueError(f"Missing required feature column: {e}. Check input data structure.")
-    
-    # 6. Predict
-    
-    # Predict the log price
+    X["indoor_area"] = np.log1p(X["indoor_area"].fillna(0))
+    X["outdoor_area"] = np.log1p(X["outdoor_area"].fillna(0))
+    X_predict = X[FINAL_FEATURE_ORDER]
     log_price_pred = PREDICTIVE_MODEL.predict(X_predict)
-    
-    # Invert the log transformation (np.expm1 is the inverse of np.log1p)
     predicted_price = np.expm1(log_price_pred[0])
-    
-    return max(0, predicted_price) # Ensure price is not negative
+    return max(0, predicted_price)
+
+
+async def predict_price_with_gemini(data: Dict[str, Any]) -> PricePredictionSchema:
+    class PropertyFeatures(PydanticBaseModel):
+        location: str
+        bedrooms: float
+        bathrooms: float
+        indoor_area: float
+        title: str
+        features: str
+        description: str
+
+    property_data = PropertyFeatures(**data)
+
+    prompt = f"""
+You are an expert real estate appraiser. Based on the following property data, 
+predict the market price in Euros (EUR). Use your general knowledge and real-time 
+search if necessary (through the search tool).
+
+PROPERTY DATA:
+- Location: {property_data.location}
+- Bedrooms: {property_data.bedrooms}
+- Bathrooms: {property_data.bathrooms}
+- Indoor Area: {property_data.indoor_area} sqm
+- Title: {property_data.title}
+- Features: {property_data.features}
+- Description: {property_data.description}
+
+Provide the predicted price strictly in the required JSON format.
+The predicted_price_eur must be a single float number.
+"""
+
+    try:
+        response = GEMINI_CLIENT.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=PricePredictionSchema,
+                tools=[{"google_search": {}}],
+            ),
+        )
+        json_string = response.text.strip()
+        prediction_result = PricePredictionSchema.model_validate_json(json_string)
+        return prediction_result
+    except Exception as exc:
+        raise RuntimeError("Gemini API prediction failed during execution or parsing.") from exc
