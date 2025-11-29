@@ -19,14 +19,19 @@ from google.genai import types
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_CLIENT = None
+print(f"[DEBUG] GEMINI_API_KEY set: {bool(GEMINI_API_KEY)}")
 if GEMINI_API_KEY:
     try:
+        print(f"[DEBUG] Initializing Gemini client with key: {GEMINI_API_KEY[:10]}...")
         GEMINI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
+        print("[DEBUG] Gemini client initialized successfully")
     except Exception as _init_exc:
-        print(f"Warning: failed to initialize Gemini client: {_init_exc}")
+        print(f"[ERROR] Failed to initialize Gemini client: {type(_init_exc).__name__}: {_init_exc}")
+        import traceback
+        traceback.print_exc()
         GEMINI_CLIENT = None
 else:
-    print("Warning: GEMINI_API_KEY environment variable not set; Gemini client disabled.")
+    print("[WARNING] GEMINI_API_KEY environment variable not set; Gemini client disabled.")
 
 
 class PricePredictionSchema(PydanticBaseModel):
@@ -159,6 +164,9 @@ def make_prediction(data: Dict[str, Any], image_inputs: List[Any]) -> float:
 
 
 async def predict_price_with_gemini(data: Dict[str, Any]) -> PricePredictionSchema:
+    import json
+    import re
+
     class PropertyFeatures(PydanticBaseModel):
         location: str
         bedrooms: float
@@ -184,22 +192,34 @@ PROPERTY DATA:
 - Features: {property_data.features}
 - Description: {property_data.description}
 
-Provide the predicted price strictly in the required JSON format.
-The predicted_price_eur must be a single float number.
+Return a JSON object with these exact fields:
+- predicted_price_eur: float (the predicted price in EUR)
+- confidence_level: float (0.0 to 1.0)
+- justification: string (brief explanation of the estimate)
 """
 
     try:
         response = GEMINI_CLIENT.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=PricePredictionSchema,
-                tools=[{"google_search": {}}],
-            ),
         )
-        json_string = response.text.strip()
-        prediction_result = PricePredictionSchema.model_validate_json(json_string)
+        response_text = response.text.strip()
+        
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if not json_match:
+            raise ValueError(f"No JSON found in response: {response_text}")
+        
+        json_string = json_match.group()
+        parsed = json.loads(json_string)
+        
+        prediction_result = PricePredictionSchema(
+            predicted_price_eur=float(parsed.get("predicted_price_eur", 0)),
+            confidence_level=float(parsed.get("confidence_level", 0.5)),
+            justification=str(parsed.get("justification", "")),
+        )
         return prediction_result
     except Exception as exc:
-        raise RuntimeError("Gemini API prediction failed during execution or parsing.") from exc
+        print(f"[ERROR] Gemini API failed: {type(exc).__name__}: {exc}")
+        import traceback
+        traceback.print_exc()
+        raise RuntimeError(f"Gemini API prediction failed: {exc}") from exc
