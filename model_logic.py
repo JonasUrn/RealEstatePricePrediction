@@ -1,9 +1,8 @@
-# model_logic.py
-
+import json
+import re
 import io
 import os
 from typing import Any, Dict, List
-
 import numpy as np
 import pandas as pd
 import requests
@@ -11,11 +10,22 @@ import torch
 from PIL import Image
 from pydantic import BaseModel as PydanticBaseModel
 from torchvision import models, transforms
-
 from catboost import CatBoostRegressor
 from google import genai
-from google.genai import types
 
+class PropertyFeatures(PydanticBaseModel):
+    location: str
+    bedrooms: float
+    bathrooms: float
+    indoor_area: float
+    title: str
+    features: str
+    description: str
+
+class PricePredictionSchema(PydanticBaseModel):
+    predicted_price_eur: float
+    confidence_level: float
+    justification: str
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_CLIENT = None
@@ -32,12 +42,6 @@ if GEMINI_API_KEY:
         GEMINI_CLIENT = None
 else:
     print("[WARNING] GEMINI_API_KEY environment variable not set; Gemini client disabled.")
-
-
-class PricePredictionSchema(PydanticBaseModel):
-    predicted_price_eur: float
-    confidence_level: float
-    justification: str
 
 
 BASE_COLS = [
@@ -71,7 +75,6 @@ preprocess = transforms.Compose(
 PREDICTIVE_MODEL = CatBoostRegressor()
 PREDICTIVE_MODEL.load_model("real_estate_model.cbm")
 
-
 def process_image(img_stream: io.BytesIO) -> np.ndarray | None:
     try:
         img = Image.open(img_stream).convert("RGB")
@@ -104,99 +107,87 @@ def get_image_features(image_streams_or_urls: List[Any], max_images: int = 3) ->
         return np.mean(features, axis=0)
     return np.zeros(512)
 
-
-def encode_location_target(df: pd.DataFrame, price_col: str = "price") -> pd.DataFrame:
-    loc_median = df.groupby("location")[price_col].median()
-    df["loc_target_enc"] = df["location"].map(loc_median).fillna(df[price_col].median())
-    loc_count = df["location"].value_counts()
-    df["loc_freq"] = df["location"].map(loc_count).fillna(0).astype(float)
-    df["loc_freq"] = df["loc_freq"] / len(df)
-    return df
-
-
-def prepare_features(df: pd.DataFrame) -> tuple[np.ndarray, List[str], List[str]]:
-    num_cols = [
-        "bedrooms",
-        "bathrooms",
-        "indoor_area",
-        "outdoor_area",
-        "total_area",
-        "has_outdoor",
-        "outdoor_ratio",
-        "bed_bath_ratio",
-        "total_rooms",
-        "room_density",
-        "area_per_bedroom",
-        "loc_target_enc",
-        "loc_freq",
-    ]
-    num = df[num_cols].values
-    emb_cols = [c for c in df.columns if c.startswith("emb_")]
-    emb = df[emb_cols].values if len(emb_cols) > 0 else np.zeros((len(df), 0))
-    X = np.hstack([num, emb])
-    return X, num_cols, emb_cols
-
-
-def normalize_numeric(X: np.ndarray, num_cols_count: int) -> tuple[np.ndarray, Any]:
-    from sklearn.preprocessing import StandardScaler
-
-    scaler = StandardScaler()
-    X_num = X[:, :num_cols_count]
-    X[:, :num_cols_count] = scaler.fit_transform(X_num)
-    return X, scaler
-
-
 def make_prediction(data: Dict[str, Any], image_inputs: List[Any]) -> float:
+    from catboost import Pool
+
+    # Extract and add image features
     image_features = get_image_features(image_inputs)
     X = pd.DataFrame([data])
     for i, feat in enumerate(image_features):
         X[f"img_feat_{i}"] = feat
+
+    # Ensure proper data types for text and categorical features
     X["features"] = X["features"].fillna("").astype(str)
     X["description"] = X["description"].fillna("").astype(str)
     X["title"] = X["title"].fillna("").astype(str)
     X["location"] = X["location"].astype(str)
-    X["indoor_area"] = np.log1p(X["indoor_area"].fillna(0))
-    X["outdoor_area"] = np.log1p(X["outdoor_area"].fillna(0))
-    X_predict = X[FINAL_FEATURE_ORDER]
-    log_price_pred = PREDICTIVE_MODEL.predict(X_predict)
-    predicted_price = np.expm1(log_price_pred[0])
+
+    # Fill missing numeric values
+    X["indoor_area"] = X["indoor_area"].fillna(0)
+    X["outdoor_area"] = X["outdoor_area"].fillna(0)
+    X["bedrooms"] = X["bedrooms"].fillna(0)
+    X["bathrooms"] = X["bathrooms"].fillna(0)
+
+    # Feature Engineering (matching training.py)
+    # Area-based features
+    X["total_area"] = X["indoor_area"] + X["outdoor_area"]
+    X["has_outdoor"] = (X["outdoor_area"] > 0).astype(float)
+    X["outdoor_ratio"] = X["outdoor_area"] / (X["total_area"] + 1)
+
+    # Room-based features
+    X["total_rooms"] = X["bedrooms"] + X["bathrooms"]
+    X["bed_bath_ratio"] = X["bedrooms"] / (X["bathrooms"] + 0.5)
+    X["room_density"] = X["total_rooms"] / (X["indoor_area"] + 1)
+    X["area_per_bedroom"] = X["indoor_area"] / (X["bedrooms"] + 1)
+
+    # Text length features
+    X["description_length"] = X["description"].str.len()
+    X["features_length"] = X["features"].str.len()
+    X["title_length"] = X["title"].str.len()
+
+    # Load location statistics and apply encoding
+    try:
+        with open("location_stats.json", "r") as f:
+            location_stats = json.load(f)
+        loc_area_median = location_stats["loc_area_median"]
+        global_median = location_stats["global_median"]
+        X["loc_area_median"] = X["location"].map(loc_area_median).fillna(global_median)
+    except FileNotFoundError:
+        print("[WARNING] location_stats.json not found, using default value")
+        X["loc_area_median"] = X["total_area"]
+
+    # Create Pool with proper feature specifications (matching training)
+    text_cols = ["description", "features", "title"]
+    cat_cols = ["location"]
+    prediction_pool = Pool(data=X, text_features=text_cols, cat_features=cat_cols)
+
+    # Predict (no log scale conversion needed)
+    predicted_price = PREDICTIVE_MODEL.predict(prediction_pool)[0]
     return max(0, predicted_price)
 
 
 async def predict_price_with_gemini(data: Dict[str, Any]) -> PricePredictionSchema:
-    import json
-    import re
-
-    class PropertyFeatures(PydanticBaseModel):
-        location: str
-        bedrooms: float
-        bathrooms: float
-        indoor_area: float
-        title: str
-        features: str
-        description: str
-
     property_data = PropertyFeatures(**data)
 
     prompt = f"""
-You are an expert real estate appraiser. Based on the following property data, 
-predict the market price in Euros (EUR). Use your general knowledge and real-time 
-search if necessary (through the search tool).
+                You are an expert real estate appraiser. Based on the following property data, 
+                predict the market price in Euros (EUR). Use your general knowledge and real-time 
+                search if necessary (through the search tool).
 
-PROPERTY DATA:
-- Location: {property_data.location}
-- Bedrooms: {property_data.bedrooms}
-- Bathrooms: {property_data.bathrooms}
-- Indoor Area: {property_data.indoor_area} sqm
-- Title: {property_data.title}
-- Features: {property_data.features}
-- Description: {property_data.description}
+                PROPERTY DATA:
+                - Location: {property_data.location}
+                - Bedrooms: {property_data.bedrooms}
+                - Bathrooms: {property_data.bathrooms}
+                - Indoor Area: {property_data.indoor_area} sqm
+                - Title: {property_data.title}
+                - Features: {property_data.features}
+                - Description: {property_data.description}
 
-Return a JSON object with these exact fields:
-- predicted_price_eur: float (the predicted price in EUR)
-- confidence_level: float (0.0 to 1.0)
-- justification: string (brief explanation of the estimate)
-"""
+                Return a JSON object with these exact fields:
+                - predicted_price_eur: float (the predicted price in EUR)
+                - confidence_level: float (0.0 to 1.0)
+                - justification: string (brief explanation of the estimate)
+            """
 
     try:
         response = GEMINI_CLIENT.models.generate_content(

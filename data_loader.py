@@ -115,11 +115,6 @@ def load_data_with_features() -> pd.DataFrame:
         positive_mask = df[col] > 0
         df.loc[positive_mask, col] = remove_iqr_outliers(df.loc[positive_mask, col])
 
-    normalization_cols = ["price", "indoor_area", "outdoor_area"]
-    print("Applying Log(1+X) transformation...")
-    for col in normalization_cols:
-        df[col] = np.log1p(df[col])
-
     df["location"] = df["location"].astype(str)
     df["bedrooms"] = df["bedrooms"].astype(float)
     df["bathrooms"] = df["bathrooms"].astype(float)
