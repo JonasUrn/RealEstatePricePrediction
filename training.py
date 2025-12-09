@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import json
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     mean_absolute_error,
@@ -17,34 +18,27 @@ print(f"Dataset loaded: {len(df)} properties")
 print(f"Price range: €{df['price'].min():,.0f} - €{df['price'].max():,.0f}")
 print(f"Price median: €{df['price'].median():,.0f}")
 
-# Feature Engineering
 print("\n=== Feature Engineering ===")
 
-# Area-based features
 df["total_area"] = df["indoor_area"] + df["outdoor_area"]
 df["has_outdoor"] = (df["outdoor_area"] > 0).astype(float)
-df["outdoor_ratio"] = df["outdoor_area"] / (df["total_area"] + 1)  # Avoid division by zero
+df["outdoor_ratio"] = df["outdoor_area"] / (df["total_area"] + 1)
 
-# Room-based features
 df["total_rooms"] = df["bedrooms"] + df["bathrooms"]
 df["bed_bath_ratio"] = df["bedrooms"] / (df["bathrooms"] + 0.5)
 df["room_density"] = df["total_rooms"] / (df["indoor_area"] + 1)
 df["area_per_bedroom"] = df["indoor_area"] / (df["bedrooms"] + 1)
 
-# Price per sqm (for location encoding)
 df["price_per_sqm"] = df["price"] / (df["total_area"] + 1)
 
-# Location-based target encoding (avoid data leakage by using training set only later)
 print("Encoding location features...")
 
-# Text length features (proxy for quality/completeness of listing)
 df["description_length"] = df["description"].fillna("").str.len()
 df["features_length"] = df["features"].fillna("").str.len()
 df["title_length"] = df["title"].fillna("").str.len()
 
 print(f"Created {len([c for c in df.columns if c not in ['reference', 'price']])} features")
 
-# Prepare data for training
 text_cols = ["description", "features", "title"]
 cat_cols = ["location"]
 
@@ -53,22 +47,19 @@ y = df["price"]
 
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-# Location target encoding using only training data
 print("\nApplying location target encoding...")
 loc_median = X_train.groupby("location")["total_area"].median()
 global_median = X_train["total_area"].median()
 X_train["loc_area_median"] = X_train["location"].map(loc_median).fillna(global_median)
 X_test["loc_area_median"] = X_test["location"].map(loc_median).fillna(global_median)
 
-# Save location statistics for prediction
-import json
 location_stats = {
     "loc_area_median": loc_median.to_dict(),
     "global_median": float(global_median)
 }
 with open("location_stats.json", "w") as f:
     json.dump(location_stats, f)
-print(f"✓ Location statistics saved to location_stats.json")
+print(f"Location statistics saved to location_stats.json")
 
 print("\n=== Training CatBoost Model ===")
 
@@ -94,11 +85,10 @@ model.fit(train_pool, eval_set=test_pool)
 MODEL_PATH = "real_estate_model.cbm"
 try:
     model.save_model(MODEL_PATH)
-    print(f"\n✓ Model successfully saved to {MODEL_PATH}")
+    print(f"\nModel successfully saved to {MODEL_PATH}")
 except Exception as e:
-    print(f"✗ Error saving model: {e}")
+    print(f"Error saving model: {e}")
 
-# Evaluate
 preds = model.predict(X_test)
 
 mae = mean_absolute_error(y_test, preds)
@@ -115,7 +105,6 @@ print(f"Mean Absolute Percentage Error:       {mape:.2%}")
 print(f"R² Score:                             {r2:.4f}")
 print("="*50)
 
-# Show feature importance
 feature_importance = model.get_feature_importance(train_pool)
 feature_names = X_train.columns.tolist()
 importance_df = pd.DataFrame({

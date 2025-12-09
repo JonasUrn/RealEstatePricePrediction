@@ -12,6 +12,7 @@ from pydantic import BaseModel as PydanticBaseModel
 from torchvision import models, transforms
 from catboost import CatBoostRegressor
 from google import genai
+from catboost import Pool
 
 class PropertyFeatures(PydanticBaseModel):
     location: str
@@ -108,44 +109,34 @@ def get_image_features(image_streams_or_urls: List[Any], max_images: int = 3) ->
     return np.zeros(512)
 
 def make_prediction(data: Dict[str, Any], image_inputs: List[Any]) -> float:
-    from catboost import Pool
-
-    # Extract and add image features
     image_features = get_image_features(image_inputs)
     X = pd.DataFrame([data])
     for i, feat in enumerate(image_features):
         X[f"img_feat_{i}"] = feat
 
-    # Ensure proper data types for text and categorical features
     X["features"] = X["features"].fillna("").astype(str)
     X["description"] = X["description"].fillna("").astype(str)
     X["title"] = X["title"].fillna("").astype(str)
     X["location"] = X["location"].astype(str)
 
-    # Fill missing numeric values
     X["indoor_area"] = X["indoor_area"].fillna(0)
     X["outdoor_area"] = X["outdoor_area"].fillna(0)
     X["bedrooms"] = X["bedrooms"].fillna(0)
     X["bathrooms"] = X["bathrooms"].fillna(0)
 
-    # Feature Engineering (matching training.py)
-    # Area-based features
     X["total_area"] = X["indoor_area"] + X["outdoor_area"]
     X["has_outdoor"] = (X["outdoor_area"] > 0).astype(float)
     X["outdoor_ratio"] = X["outdoor_area"] / (X["total_area"] + 1)
 
-    # Room-based features
     X["total_rooms"] = X["bedrooms"] + X["bathrooms"]
     X["bed_bath_ratio"] = X["bedrooms"] / (X["bathrooms"] + 0.5)
     X["room_density"] = X["total_rooms"] / (X["indoor_area"] + 1)
     X["area_per_bedroom"] = X["indoor_area"] / (X["bedrooms"] + 1)
 
-    # Text length features
     X["description_length"] = X["description"].str.len()
     X["features_length"] = X["features"].str.len()
     X["title_length"] = X["title"].str.len()
 
-    # Load location statistics and apply encoding
     try:
         with open("location_stats.json", "r") as f:
             location_stats = json.load(f)
@@ -156,12 +147,10 @@ def make_prediction(data: Dict[str, Any], image_inputs: List[Any]) -> float:
         print("[WARNING] location_stats.json not found, using default value")
         X["loc_area_median"] = X["total_area"]
 
-    # Create Pool with proper feature specifications (matching training)
     text_cols = ["description", "features", "title"]
     cat_cols = ["location"]
     prediction_pool = Pool(data=X, text_features=text_cols, cat_features=cat_cols)
 
-    # Predict (no log scale conversion needed)
     predicted_price = PREDICTIVE_MODEL.predict(prediction_pool)[0]
     return max(0, predicted_price)
 
