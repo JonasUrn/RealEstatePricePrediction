@@ -1,7 +1,23 @@
-descriptions/
+# Virtual environments
 venv/
+.venv/
+
+# project files
+descriptions/
 properties.csv
 model/
 images/
-__pycache__/
 text_features.csv
+
+# Python stuff
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+
+# Streamlit configs and caches
+.streamlit/*.lock
+
+# Environment files
+.env
+.env.*

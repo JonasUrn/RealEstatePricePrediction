@@ -1,0 +1,7 @@
+[theme]
+base = "dark"
+primaryColor = "#14b8a6"              # teal (accent for buttons)
+backgroundColor = "#0f172a"           # very dark slate blue
+secondaryBackgroundColor = "#1f2937"  # slate
+textColor = "#e5e7eb"                 # light slate
+font = "sans serif"
